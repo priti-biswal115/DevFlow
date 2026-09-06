@@ -1,12 +1,16 @@
 import * as vscode from 'vscode';
 import { Ticket } from '../types/ticket';
 import { FileDiscoveryService } from '../services/FileDiscoveryService';
+import { CopilotService } from '../services/CopilotService';
+import { ChangeApplyService } from '../services/ChangeApplyService';
 
 export class TicketDetailsPanel {
     public static currentPanel: TicketDetailsPanel | undefined;
     private readonly _panel: vscode.WebviewPanel;
     private _disposables: vscode.Disposable[] = [];
     private _ticket: Ticket;
+    private _cancellationTokenSource?: vscode.CancellationTokenSource;
+    private _lastContextPackage: any;
 
     private constructor(panel: vscode.WebviewPanel, ticket: Ticket) {
         this._panel = panel;
@@ -22,6 +26,23 @@ export class TicketDetailsPanel {
                         break;
                     case 'solveWithAgent':
                         await this._handleSolveWithAgent(message.relevantFiles);
+                        break;
+                    case 'confirmStartAgent':
+                        await this._handleStartAgent();
+                        break;
+                    case 'applyChanges':
+                        await this._handleApplyChanges(message.content);
+                        break;
+                    case 'reviewChanges':
+                        await this._handleReviewChanges(message.content);
+                        break;
+                    case 'openInCopilotChat':
+                        await this._handleOpenInCopilotChat();
+                        break;
+                    case 'cancelAgent':
+                        if (this._cancellationTokenSource) {
+                            this._cancellationTokenSource.cancel();
+                        }
                         break;
                 }
             },
@@ -78,7 +99,7 @@ export class TicketDetailsPanel {
                 })
             );
 
-            const contextPackage = {
+            this._lastContextPackage = {
                 ticket: {
                     id: this._ticket.id,
                     title: this._ticket.title,
@@ -87,9 +108,98 @@ export class TicketDetailsPanel {
                 relevantFiles: filesWithContents
             };
 
-            this._panel.webview.postMessage({ type: 'contextPrepared', payload: contextPackage });
+            this._panel.webview.postMessage({ type: 'contextPrepared', payload: this._lastContextPackage });
         } catch (error: any) {
             vscode.window.showErrorMessage(`Error preparing context: ${error.message}`);
+        }
+    }
+
+    private async _handleStartAgent() {
+        if (!this._lastContextPackage) return;
+
+        this._cancellationTokenSource = new vscode.CancellationTokenSource();
+        this._panel.webview.postMessage({ type: 'agentStarted' });
+
+        try {
+            await CopilotService.executeTicket(
+                this._lastContextPackage,
+                (chunk) => {
+                    this._panel.webview.postMessage({ type: 'agentChunk', chunk });
+                },
+                this._cancellationTokenSource.token
+            );
+            this._panel.webview.postMessage({ type: 'agentCompleted' });
+        } catch (error: any) {
+            vscode.window.showErrorMessage(`Agent error: ${error.message}`);
+            this._panel.webview.postMessage({ type: 'agentError', message: error.message });
+        }
+    }
+
+    private async _handleApplyChanges(content: string) {
+        try {
+            const edits = await ChangeApplyService.parseEdits(content ?? '');
+            if (edits.length === 0) {
+                vscode.window.showWarningMessage(
+                    'DevFlow: the agent response contained no file blocks to apply. Re-run the agent, or use "Continue in Copilot Chat".'
+                );
+                return;
+            }
+
+            await ChangeApplyService.apply(edits);
+            this._panel.webview.postMessage({
+                type: 'changesApplied',
+                files: edits.map(e => e.relativePath)
+            });
+
+            const choice = await vscode.window.showInformationMessage(
+                `DevFlow applied changes to ${edits.length} file(s). Changed lines are highlighted in green.`,
+                'Keep',
+                'Undo All'
+            );
+            if (choice === 'Undo All') {
+                await ChangeApplyService.undoLast();
+            } else if (choice === 'Keep') {
+                ChangeApplyService.clearHighlights();
+            }
+        } catch (error: any) {
+            vscode.window.showErrorMessage(`DevFlow: failed to apply changes. ${error.message}`);
+        }
+    }
+
+    private async _handleReviewChanges(content: string) {
+        try {
+            const edits = await ChangeApplyService.parseEdits(content ?? '');
+            if (edits.length === 0) {
+                vscode.window.showWarningMessage('DevFlow: the agent response contained no file blocks to review.');
+                return;
+            }
+            await ChangeApplyService.review(edits);
+        } catch (error: any) {
+            vscode.window.showErrorMessage(`DevFlow: failed to open the diff view. ${error.message}`);
+        }
+    }
+
+    private async _handleOpenInCopilotChat() {
+        const contextPackage = this._lastContextPackage ?? {
+            ticket: { id: this._ticket.id, title: this._ticket.title, description: this._ticket.description },
+            relevantFiles: []
+        };
+        const query = CopilotService.buildChatPrompt(contextPackage);
+
+        try {
+            await vscode.commands.executeCommand('workbench.action.chat.open', {
+                query,
+                mode: 'agent'
+            });
+        } catch {
+            try {
+                await vscode.commands.executeCommand('workbench.action.chat.open', query);
+            } catch {
+                await vscode.env.clipboard.writeText(query);
+                vscode.window.showWarningMessage(
+                    'DevFlow: could not open Copilot Chat. The prompt was copied to your clipboard instead.'
+                );
+            }
         }
     }
 
@@ -192,9 +302,25 @@ export class TicketDetailsPanel {
         <p>Prepare the context package with the discovered files and ticket details for the AI Agent.</p>
         <button id="btnSolve" disabled>Solve With Agent</button>
         <div id="agentStatus" class="hidden" style="color: var(--vscode-descriptionForeground); font-style: italic;">Preparing context...</div>
+        
         <div id="agentPayloadContainer" class="hidden">
             <h3 style="margin-bottom: 8px; font-size: 13px;">Prepared Context Payload:</h3>
             <pre id="agentPayload"></pre>
+            <div style="margin-top: 10px; display: flex; gap: 10px;">
+                <button id="btnConfirmAgent" style="background: var(--vscode-charts-green); color: white;">Confirm & Start Agent</button>
+            </div>
+        </div>
+
+        <div id="agentOutputContainer" class="hidden" style="margin-top: 15px; border-top: 1px solid var(--vscode-panel-border); padding-top: 15px;">
+            <h3>Agent Output</h3>
+            <div id="streamingStatus" style="font-weight: bold; margin-bottom: 10px;">Status: Running...</div>
+            <pre id="agentOutput" style="white-space: pre-wrap; word-wrap: break-word; min-height: 100px;"></pre>
+            <div id="agentActions" class="hidden" style="margin-top: 10px; display: flex; gap: 10px; flex-wrap: wrap;">
+                <button id="btnReviewChanges">Review Changes</button>
+                <button id="btnApplyChanges" style="background: var(--vscode-charts-blue); color: white;">Apply Changes</button>
+                <button id="btnCopilotChat" style="background: transparent; color: var(--vscode-textLink-foreground); border: 1px solid var(--vscode-panel-border);">Continue in Copilot Chat</button>
+            </div>
+            <div id="applyResult" class="hidden" style="margin-top: 10px; font-size: 12px; color: var(--vscode-charts-green);"></div>
         </div>
     </div>
 
@@ -217,7 +343,18 @@ export class TicketDetailsPanel {
         const agentPayloadContainer = document.getElementById('agentPayloadContainer');
         const agentPayload = document.getElementById('agentPayload');
         
+        const btnConfirmAgent = document.getElementById('btnConfirmAgent');
+        const agentOutputContainer = document.getElementById('agentOutputContainer');
+        const streamingStatus = document.getElementById('streamingStatus');
+        const agentOutput = document.getElementById('agentOutput');
+        const agentActions = document.getElementById('agentActions');
+        const btnReviewChanges = document.getElementById('btnReviewChanges');
+        const btnApplyChanges = document.getElementById('btnApplyChanges');
+        const btnCopilotChat = document.getElementById('btnCopilotChat');
+        const applyResult = document.getElementById('applyResult');
+        
         let discoveredFiles = [];
+        let fullAgentResponse = '';
 
         btnFindFiles.addEventListener('click', () => {
             btnFindFiles.disabled = true;
@@ -231,7 +368,31 @@ export class TicketDetailsPanel {
             btnSolve.disabled = true;
             agentStatus.classList.remove('hidden');
             agentPayloadContainer.classList.add('hidden');
+            agentOutputContainer.classList.add('hidden');
             vscode.postMessage({ type: 'solveWithAgent', relevantFiles: discoveredFiles });
+        });
+
+        btnConfirmAgent.addEventListener('click', () => {
+            btnConfirmAgent.disabled = true;
+            agentPayloadContainer.classList.add('hidden');
+            agentOutputContainer.classList.remove('hidden');
+            agentOutput.textContent = '';
+            fullAgentResponse = '';
+            streamingStatus.textContent = 'Status: Running...';
+            agentActions.classList.add('hidden');
+            vscode.postMessage({ type: 'confirmStartAgent' });
+        });
+
+        btnReviewChanges.addEventListener('click', () => {
+            vscode.postMessage({ type: 'reviewChanges', content: fullAgentResponse });
+        });
+
+        btnApplyChanges.addEventListener('click', () => {
+            vscode.postMessage({ type: 'applyChanges', content: fullAgentResponse });
+        });
+
+        btnCopilotChat.addEventListener('click', () => {
+            vscode.postMessage({ type: 'openInCopilotChat' });
         });
 
         window.addEventListener('message', event => {
@@ -268,9 +429,30 @@ export class TicketDetailsPanel {
                     break;
                 case 'contextPrepared':
                     agentStatus.classList.add('hidden');
-                    btnSolve.disabled = false;
+                    btnConfirmAgent.disabled = false;
                     agentPayload.textContent = JSON.stringify(message.payload, null, 2);
                     agentPayloadContainer.classList.remove('hidden');
+                    break;
+                case 'agentStarted':
+                    break;
+                case 'agentChunk':
+                    fullAgentResponse += message.chunk;
+                    agentOutput.textContent = fullAgentResponse;
+                    // Auto-scroll to bottom
+                    agentOutput.scrollTop = agentOutput.scrollHeight;
+                    break;
+                case 'agentCompleted':
+                    streamingStatus.textContent = 'Status: Completed';
+                    agentActions.classList.remove('hidden');
+                    break;
+                case 'changesApplied':
+                    applyResult.textContent = 'Applied to: ' + message.files.join(', ');
+                    applyResult.classList.remove('hidden');
+                    break;
+                case 'agentError':
+                    streamingStatus.textContent = 'Status: Error';
+                    streamingStatus.style.color = 'var(--vscode-errorForeground)';
+                    agentOutput.textContent += '\\n\\nError: ' + message.message;
                     break;
             }
         });

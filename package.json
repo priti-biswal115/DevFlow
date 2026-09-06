@@ -16,6 +16,10 @@
       {
         "command": "devflow.helloWorld",
         "title": "Hello World"
+      },
+      {
+        "command": "devflow.clearChangeHighlights",
+        "title": "DevFlow: Clear Change Highlights"
       }
     ],
     "viewsContainers": {

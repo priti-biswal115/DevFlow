@@ -3,6 +3,7 @@
 import * as vscode from 'vscode';
 import { DevFlowViewProvider } from './DevFlowViewProvider';
 import { TicketDetailsPanel } from './panels/TicketDetailsPanel';
+import { ChangeApplyService } from './services/ChangeApplyService';
 import { Ticket } from './types/ticket';
 
 
@@ -30,6 +31,14 @@ export function activate(context: vscode.ExtensionContext) {
 	context.subscriptions.push(
 		vscode.commands.registerCommand('devflow.openTicketDetails', (ticket: Ticket) => {
 			TicketDetailsPanel.render(ticket);
+		})
+	);
+
+	ChangeApplyService.register(context);
+
+	context.subscriptions.push(
+		vscode.commands.registerCommand('devflow.clearChangeHighlights', () => {
+			ChangeApplyService.clearHighlights();
 		})
 	);
 }
