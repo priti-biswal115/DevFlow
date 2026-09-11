@@ -9,7 +9,28 @@ export class DevFlowViewProvider implements vscode.WebviewViewProvider {
     private _view?: vscode.WebviewView;
     private _connected = false;
 
-    constructor(private readonly context: vscode.ExtensionContext) {}
+    constructor(private readonly context: vscode.ExtensionContext) {
+        this.initializeConnection();
+    }
+
+    // ── Auto reconnect ─────────────────────────────────────────────────────────
+
+    private async initializeConnection(): Promise<void> {
+        try {
+            const isValid = await AdoService.validateConnection(this.context);
+            this._connected = isValid;
+
+            if (isValid) {
+                await this._handleFetchProjects();
+                await this._handleFetchTickets();
+            }
+
+            this._post({ type: 'status', state: this._connected ? 'connected' : 'disconnected' });
+        } catch (error) {
+            this._connected = false;
+            console.error('DevFlow auto reconnect failed:', error);
+        }
+    }
 
     resolveWebviewView(webviewView: vscode.WebviewView) {
         this._view = webviewView;
@@ -23,6 +44,12 @@ export class DevFlowViewProvider implements vscode.WebviewViewProvider {
                     break;
                 case 'fetchTickets':
                     await this._handleFetchTickets();
+                    break;
+                case 'fetchProjects':
+                    await this._handleFetchProjects();
+                    break;
+                case 'selectProject':
+                    await this._handleSelectProject(msg.project);
                     break;
                 case 'openTicket':
                     this._handleOpenTicket(msg.id);
@@ -67,12 +94,29 @@ export class DevFlowViewProvider implements vscode.WebviewViewProvider {
         if (ok) {
             this._connected = true;
             this._post({ type: 'status', state: 'connected' });
+            await this._handleFetchProjects();
         } else {
             // Clear bad credentials
             await AdoService.clearCredentials(this.context);
             this._post({ type: 'status', state: 'disconnected' });
             vscode.window.showErrorMessage('DevFlow: Connection failed — check your org URL and PAT.');
         }
+    }
+
+    // ── Projects ───────────────────────────────────────────────────────────────
+
+    private async _handleFetchProjects() {
+        try {
+            const projects = await AdoService.getProjects(this.context);
+            this._post({ type: 'projectsLoaded', projects });
+        } catch (err: any) {
+            this._post({ type: 'projectsError', message: err.message });
+        }
+    }
+
+    private async _handleSelectProject(project: string) {
+        await AdoService.setProject(this.context, project);
+        await this._handleFetchTickets();
     }
 
     // ── Fetch Tickets ──────────────────────────────────────────────────────────
@@ -155,6 +199,16 @@ export class DevFlowViewProvider implements vscode.WebviewViewProvider {
   .btn-connect:hover { background: var(--vscode-button-hoverBackground); }
   .btn-connect:disabled { opacity: 0.5; cursor: default; }
 
+  #projectSelect {
+    background: var(--vscode-dropdown-background);
+    color: var(--vscode-dropdown-foreground);
+    border: 1px solid var(--vscode-dropdown-border);
+    border-radius: 3px;
+    font-size: 11px;
+    padding: 2px 4px;
+    max-width: 110px;
+  }
+
   /* ── Nav rows ── */
   .nav-item {
     display: flex; align-items: center; gap: 10px;
@@ -229,6 +283,7 @@ export class DevFlowViewProvider implements vscode.WebviewViewProvider {
     <span class="dot" id="statusDot"></span>
     <span id="statusText">Not connected</span>
   </div>
+  <select id="projectSelect" style="display:none;"></select>
   <button class="btn-connect" id="btnConnect">Connect</button>
 </div>
 
@@ -272,6 +327,7 @@ export class DevFlowViewProvider implements vscode.WebviewViewProvider {
   const navTickets = document.getElementById('navTickets');
   const ticketList = document.getElementById('ticketList');
   const ticketBadge = document.getElementById('ticketBadge');
+  const projectSelect = document.getElementById('projectSelect');
 
   // ── UI helpers ──────────────────────────────────────────────────────────────
 
@@ -327,6 +383,10 @@ export class DevFlowViewProvider implements vscode.WebviewViewProvider {
     vscode.postMessage({ type: 'connect' });
   });
 
+  projectSelect.addEventListener('change', () => {
+    vscode.postMessage({ type: 'selectProject', project: projectSelect.value });
+  });
+
   let ticketOpen = false;
   navTickets.addEventListener('click', () => {
     ticketOpen = !ticketOpen;
@@ -356,6 +416,10 @@ export class DevFlowViewProvider implements vscode.WebviewViewProvider {
         break;
       case 'ticketsLoaded':
         renderTickets(msg.tickets);
+        break;
+      case 'projectsLoaded':
+        projectSelect.innerHTML = msg.projects.map(p => \`<option value="\${escHtml(p)}">\${escHtml(p)}</option>\`).join('');
+        projectSelect.style.display = '';
         break;
       case 'ticketsError':
         ticketList.innerHTML = \`<div class="info-msg" style="color:var(--vscode-errorForeground)">\${escHtml(msg.message)}</div>\`;

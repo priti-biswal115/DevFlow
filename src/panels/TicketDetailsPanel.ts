@@ -1,8 +1,10 @@
 import * as vscode from 'vscode';
 import { Ticket } from '../types/ticket';
-import { FileDiscoveryService } from '../services/FileDiscoveryService';
+import { FileDiscoveryService, DiscoveredFile } from '../services/FileDiscoveryService';
 import { CopilotService } from '../services/CopilotService';
 import { ChangeApplyService } from '../services/ChangeApplyService';
+import { GitService } from '../services/GitService';
+import { BranchSessionService } from '../services/BranchSessionService';
 
 export class TicketDetailsPanel {
     public static currentPanel: TicketDetailsPanel | undefined;
@@ -23,6 +25,24 @@ export class TicketDetailsPanel {
                 switch (message.type) {
                     case 'findRelevantFiles':
                         await this._handleFindRelevantFiles();
+                        break;
+                    case 'loadBranches':
+                        await this._handleLoadBranches();
+                        break;
+                    case 'loadBranchSession':
+                        await this._handleLoadBranchSession();
+                        break;
+                    case 'continueWorking':
+                        await this._handleContinueWorking(message.branch);
+                        break;
+                    case 'createNewBranch':
+                        this._panel.webview.postMessage({ type: 'newBranchMode' });
+                        break;
+                    case 'startWork':
+                        await this._handleStartWork(message.baseBranch, message.workingBranch);
+                        break;
+                    case 'navigateMethod':
+                        await this._handleNavigateMethod(message.file, message.line);
                         break;
                     case 'solveWithAgent':
                         await this._handleSolveWithAgent(message.relevantFiles);
@@ -69,6 +89,56 @@ export class TicketDetailsPanel {
         TicketDetailsPanel.currentPanel = new TicketDetailsPanel(panel, ticket);
     }
 
+    private async _handleLoadBranches() {
+        try {
+            const branches = await GitService.getBranches();
+            this._panel.webview.postMessage({ type: 'branchesLoaded', branches });
+        } catch (error: any) {
+            this._panel.webview.postMessage({ type: 'branchError', message: error.message });
+        }
+    }
+
+    private async _handleLoadBranchSession() {
+        try {
+            const branch = await BranchSessionService.getTicketBranch(this._ticket.id);
+            this._panel.webview.postMessage({ type: 'branchSessionLoaded', branch });
+        } catch (error: any) {
+            this._panel.webview.postMessage({ type: 'branchSessionError', message: error.message });
+        }
+    }
+
+    private async _handleContinueWorking(branch: string) {
+        try {
+            await GitService.checkoutBranch(branch);
+            this._panel.webview.postMessage({
+                type: 'workReady',
+                baseBranch: branch,
+                workingBranch: branch
+            });
+        } catch (error: any) {
+            this._panel.webview.postMessage({ type: 'branchError', message: error.message });
+        }
+    }
+
+    private async _handleStartWork(baseBranch: string, workingBranch: string) {
+        if (!baseBranch || !workingBranch.trim()) {
+            this._panel.webview.postMessage({ type: 'branchError', message: 'Select a base branch and enter a new branch name.' });
+            return;
+        }
+
+        try {
+            await GitService.startWork(baseBranch, workingBranch.trim());
+            await BranchSessionService.saveTicketBranch(this._ticket.id, workingBranch.trim());
+            this._panel.webview.postMessage({
+                type: 'workReady',
+                baseBranch,
+                workingBranch: workingBranch.trim()
+            });
+        } catch (error: any) {
+            this._panel.webview.postMessage({ type: 'branchError', message: error.message });
+        }
+    }
+
     private async _handleFindRelevantFiles() {
         try {
             this._panel.webview.postMessage({ type: 'discoveringFiles' });
@@ -80,7 +150,19 @@ export class TicketDetailsPanel {
         }
     }
 
-    private async _handleSolveWithAgent(relevantFiles: any[]) {
+    private async _handleNavigateMethod(file: string, line: number) {
+        try {
+            const document = await vscode.workspace.openTextDocument(vscode.Uri.file(file));
+            const editor = await vscode.window.showTextDocument(document, vscode.ViewColumn.One);
+            const position = new vscode.Position(Math.max(0, line - 1), 0);
+            editor.revealRange(new vscode.Range(position, position), vscode.TextEditorRevealType.InCenter);
+            editor.selection = new vscode.Selection(position, position);
+        } catch (error: any) {
+            vscode.window.showErrorMessage(`DevFlow: could not open method location. ${error.message}`);
+        }
+    }
+
+    private async _handleSolveWithAgent(relevantFiles: DiscoveredFile[]) {
         try {
             this._panel.webview.postMessage({ type: 'preparingContext' });
             
@@ -105,7 +187,9 @@ export class TicketDetailsPanel {
                     title: this._ticket.title,
                     description: this._ticket.description,
                 },
-                relevantFiles: filesWithContents
+                relevantFiles: filesWithContents,
+                symbols: relevantFiles.flatMap((file) => file.matchedSymbols),
+                methods: relevantFiles.flatMap((file) => file.relevantMethods)
             };
 
             this._panel.webview.postMessage({ type: 'contextPrepared', payload: this._lastContextPackage });
@@ -115,7 +199,9 @@ export class TicketDetailsPanel {
     }
 
     private async _handleStartAgent() {
-        if (!this._lastContextPackage) return;
+        if (!this._lastContextPackage) {
+            return;
+        }
 
         this._cancellationTokenSource = new vscode.CancellationTokenSource();
         this._panel.webview.postMessage({ type: 'agentStarted' });
@@ -264,11 +350,37 @@ export class TicketDetailsPanel {
         }
         button:hover { background: var(--vscode-button-hoverBackground); }
         button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+        select, input {
+            color: var(--vscode-input-foreground);
+            background: var(--vscode-input-background);
+            border: 1px solid var(--vscode-input-border);
+            padding: 6px 8px;
+            border-radius: 3px;
+            font-size: 13px;
+        }
+        label { display: flex; flex-direction: column; gap: 6px; font-weight: 600; }
+
+        #newBranchForm {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .branch-actions {
+            margin-top: 16px;
+        }
+
+        .branch-actions button {
+            min-width: 120px;
+        }
         
         .file-list { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
         .file-item { display: flex; justify-content: space-between; padding: 8px; background: var(--vscode-editor-background); border: 1px solid var(--vscode-panel-border); border-radius: 4px; }
         .file-path { font-family: var(--vscode-editor-font-family); font-size: 12px; }
         .file-match { font-size: 12px; font-weight: bold; color: var(--vscode-charts-green); }
+        .method-list { margin: 4px 0 0 16px; font-size: 12px; }
+        .method-link { color: var(--vscode-textLink-foreground); cursor: pointer; }
         
         pre { background: var(--vscode-editor-background); padding: 10px; border-radius: 4px; overflow: auto; font-family: var(--vscode-editor-font-family); font-size: 12px; border: 1px solid var(--vscode-panel-border); }
         .hidden { display: none !important; }
@@ -287,11 +399,41 @@ export class TicketDetailsPanel {
         </div>
     </div>
 
+    <!-- 1. Branch Setup -->
+    <div class="section">
+        <h2>1. Branch Setup</h2>
+        <div id="existingBranch" class="hidden">
+            <strong>Current Working Branch:</strong> <span id="currentBranch"></span>
+            <div style="display: flex; gap: 8px; margin-top: 8px;">
+                <button id="btnContinueWorking">Continue Working</button>
+                <button id="btnCreateNewBranch">Create New Branch</button>
+            </div>
+        </div>
+        <div id="newBranchForm">
+            <label>Base Branch
+                <select id="baseBranch">
+                    <option value="">Loading branches...</option>
+                </select>
+            </label>
+
+            <label>New Branch Name
+                <input id="workingBranch" type="text" value="feature-${t.id}-${this._slugify(t.title)}" />
+            </label>
+
+            <div class="branch-actions">
+                <button id="btnStartWork" disabled>
+                    Start Work
+                </button>
+            </div>
+        </div>
+        <div id="branchStatus" style="color: var(--vscode-descriptionForeground);">Loading local branches...</div>
+    </div>
+
     <!-- 1. Context Discovery -->
     <div class="section">
         <h2>1. Context Discovery</h2>
         <p>Find relevant files in the workspace based on the ticket details.</p>
-        <button id="btnFindFiles">Find Relevant Files</button>
+        <button id="btnFindFiles" disabled>Find Relevant Files</button>
         <div id="discoveryStatus" class="hidden" style="color: var(--vscode-descriptionForeground); font-style: italic;">Searching...</div>
         <div id="fileResults" class="file-list hidden"></div>
     </div>
@@ -337,6 +479,15 @@ export class TicketDetailsPanel {
         const btnFindFiles = document.getElementById('btnFindFiles');
         const discoveryStatus = document.getElementById('discoveryStatus');
         const fileResults = document.getElementById('fileResults');
+        const baseBranch = document.getElementById('baseBranch');
+        const workingBranch = document.getElementById('workingBranch');
+        const btnStartWork = document.getElementById('btnStartWork');
+        const branchStatus = document.getElementById('branchStatus');
+        const existingBranch = document.getElementById('existingBranch');
+        const currentBranch = document.getElementById('currentBranch');
+        const newBranchForm = document.getElementById('newBranchForm');
+        const btnContinueWorking = document.getElementById('btnContinueWorking');
+        const btnCreateNewBranch = document.getElementById('btnCreateNewBranch');
         
         const btnSolve = document.getElementById('btnSolve');
         const agentStatus = document.getElementById('agentStatus');
@@ -355,6 +506,38 @@ export class TicketDetailsPanel {
         
         let discoveredFiles = [];
         let fullAgentResponse = '';
+
+        vscode.postMessage({ type: 'loadBranches' });
+        vscode.postMessage({ type: 'loadBranchSession' });
+
+        btnContinueWorking.addEventListener('click', () => {
+            btnContinueWorking.disabled = true;
+            branchStatus.textContent = 'Checking out existing working branch...';
+            vscode.postMessage({ type: 'continueWorking', branch: currentBranch.textContent });
+        });
+
+        btnCreateNewBranch.addEventListener('click', () => {
+            existingBranch.classList.add('hidden');
+            newBranchForm.classList.remove('hidden');
+        });
+
+        baseBranch.addEventListener('change', () => {
+            btnStartWork.disabled = !baseBranch.value || !workingBranch.value.trim();
+        });
+
+        workingBranch.addEventListener('input', () => {
+            btnStartWork.disabled = !baseBranch.value || !workingBranch.value.trim();
+        });
+
+        btnStartWork.addEventListener('click', () => {
+            btnStartWork.disabled = true;
+            branchStatus.textContent = 'Checking out base branch, pulling latest, and creating working branch...';
+            vscode.postMessage({
+                type: 'startWork',
+                baseBranch: baseBranch.value,
+                workingBranch: workingBranch.value
+            });
+        });
 
         btnFindFiles.addEventListener('click', () => {
             btnFindFiles.disabled = true;
@@ -398,6 +581,41 @@ export class TicketDetailsPanel {
         window.addEventListener('message', event => {
             const message = event.data;
             switch (message.type) {
+                case 'branchesLoaded':
+                    baseBranch.innerHTML = message.branches.map(branch =>
+                        '<option value="' + escapeHtml(branch) + '">' + escapeHtml(branch) + '</option>'
+                    ).join('');
+                    btnStartWork.disabled = message.branches.length === 0 || !workingBranch.value.trim();
+                    branchStatus.textContent = message.branches.length
+                        ? 'Select a successful base branch and start work.'
+                        : 'No local branches found.';
+                    break;
+                case 'branchSessionLoaded':
+                    if (message.branch) {
+                        currentBranch.textContent = message.branch;
+                        existingBranch.classList.remove('hidden');
+                        newBranchForm.classList.add('hidden');
+                        branchStatus.textContent = 'Continue working on the existing branch or create a new one.';
+                    }
+                    break;
+                case 'branchSessionError':
+                    branchStatus.textContent = message.message;
+                    break;
+                case 'newBranchMode':
+                    branchStatus.textContent = 'Select a base branch and start a new branch.';
+                    break;
+                case 'workReady':
+                    branchStatus.textContent = 'Selected Base Branch: ' + message.baseBranch
+                        + ' | Working Branch: ' + message.workingBranch
+                        + ' | Status: Ready';
+                    branchStatus.style.color = 'var(--vscode-charts-green)';
+                    btnFindFiles.disabled = false;
+                    break;
+                case 'branchError':
+                    branchStatus.textContent = 'Branch setup failed: ' + message.message;
+                    branchStatus.style.color = 'var(--vscode-errorForeground)';
+                    btnStartWork.disabled = false;
+                    break;
                 case 'discoveringFiles':
                     discoveryStatus.textContent = 'Searching workspace...';
                     break;
@@ -411,10 +629,22 @@ export class TicketDetailsPanel {
                     } else {
                         fileResults.innerHTML = discoveredFiles.map(f => \`
                             <div class="file-item">
-                                <span class="file-path">\${f.relativePath}</span>
+                                <div>
+                                    <div class="file-path">\${f.relativePath}</div>
+                                    <div class="method-list">\${(f.relevantMethods || []).map(m =>
+                                        \`<div class="method-link" data-file="\${escapeHtml(m.file)}" data-line="\${m.line}">• \${escapeHtml(m.name)}()</div>\`
+                                    ).join('')}</div>
+                                </div>
                                 <span class="file-match">\${Math.round(f.score * 100)}% Match</span>
                             </div>
                         \`).join('');
+                        fileResults.querySelectorAll('.method-link').forEach(method => {
+                            method.addEventListener('click', () => vscode.postMessage({
+                                type: 'navigateMethod',
+                                file: method.dataset.file,
+                                line: Number(method.dataset.line)
+                            }));
+                        });
                         btnSolve.disabled = false;
                     }
                     fileResults.classList.remove('hidden');
@@ -456,17 +686,35 @@ export class TicketDetailsPanel {
                     break;
             }
         });
+
+        function escapeHtml(value) {
+            return String(value)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;');
+        }
     </script>
 </body>
 </html>`;
     }
 
     private _escapeHtml(str: string): string {
-        if (!str) return '';
+        if (!str) {
+            return '';
+        }
         return str
             .replace(/&/g, '&amp;')
             .replace(/</g, '&lt;')
             .replace(/>/g, '&gt;')
             .replace(/"/g, '&quot;');
+    }
+
+    private _slugify(str: string): string {
+        return str
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, '-')
+            .replace(/^-+|-+$/g, '')
+            .slice(0, 50);
     }
 }

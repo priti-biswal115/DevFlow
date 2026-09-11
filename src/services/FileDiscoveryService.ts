@@ -1,8 +1,18 @@
 import * as vscode from 'vscode';
 import { Ticket } from '../types/ticket';
+import { MethodDiscoveryService, RelevantMethod } from './MethodDiscoveryService';
+import { SymbolMatch, SymbolSearchService } from './SymbolSearchService';
+
+export interface DiscoveredFile {
+    path: string;
+    relativePath: string;
+    score: number;
+    matchedSymbols: Array<Pick<SymbolMatch, 'name' | 'kind' | 'line'>>;
+    relevantMethods: RelevantMethod[];
+}
 
 export class FileDiscoveryService {
-    public static async findRelevantFiles(ticket: Ticket): Promise<{ path: string; relativePath: string; score: number }[]> {
+    public static async findRelevantFiles(ticket: Ticket): Promise<DiscoveredFile[]> {
         // 1. Extract Keywords
         const keywords = this.extractKeywords(ticket.title, ticket.description);
         if (keywords.length === 0) {
@@ -14,30 +24,62 @@ export class FileDiscoveryService {
         const excludePattern = '**/{node_modules,.git,dist,build,coverage,out}/**';
         const files = await vscode.workspace.findFiles('**/*', excludePattern, 1000); // Limit to 1000 files to avoid performance issues
 
+        const symbols = await SymbolSearchService.searchSymbols(keywords);
+
         // 3. Rank Matching Files
-        const rankedFiles = files.map(uri => {
+        const rankedFiles = (await Promise.all(files.map(async uri => {
             const relativePath = vscode.workspace.asRelativePath(uri);
             const score = this.calculateMatchScore(relativePath, keywords);
+            const content = await this.readTextContent(uri);
             return {
                 path: uri.fsPath,
                 relativePath,
-                score
+                score: score + this.calculateContentScore(content, keywords),
+                matchedSymbols: [] as DiscoveredFile['matchedSymbols'],
+                relevantMethods: [] as RelevantMethod[]
             };
-        }).filter(f => f.score > 0); // Only keep files that have some match
+        }))).filter((file) => file.score > 0);
+
+        const filesByPath = new Map(rankedFiles.map(file => [file.path, file]));
+        for (const symbol of symbols) {
+            const file = filesByPath.get(symbol.filePath);
+            if (!file) {
+                continue;
+            }
+
+            file.score += this.symbolMatchScore(symbol.kind);
+            file.matchedSymbols.push({
+                name: symbol.name,
+                kind: symbol.kind,
+                line: symbol.line
+            });
+        }
+
+        const relevantFiles = rankedFiles.filter(f => f.score > 0);
 
         // Sort descending by score
-        rankedFiles.sort((a, b) => b.score - a.score);
+        relevantFiles.sort((a, b) => b.score - a.score);
 
         // Normalize scores to be percentages of the max score if we want, or just max out at 1
         // Here we'll just cap it at 1 for percentage display (e.g. 0.87 = 87%)
-        const maxScore = rankedFiles.length > 0 ? rankedFiles[0].score : 1;
-        const normalizedFiles = rankedFiles.map(f => ({
+        const maxScore = relevantFiles.length > 0 ? relevantFiles[0].score : 1;
+        const topFiles = relevantFiles.slice(0, 10);
+        const methods = await MethodDiscoveryService.findRelevantMethods(
+            topFiles.map((file) => file.path),
+            keywords
+        );
+        const filesWithMethods = topFiles.map((file) => {
+            file.relevantMethods = methods.filter((method) => method.file === file.path);
+            return file;
+        });
+
+        const normalizedFiles = filesWithMethods.map(f => ({
             ...f,
             score: maxScore > 0 ? (f.score / maxScore) * 0.99 : 0 // max 99% for realism, adjust as needed
         }));
 
         // 4. Display Top 10
-        return normalizedFiles.slice(0, 10);
+        return normalizedFiles;
     }
 
     private static extractKeywords(title: string, description: string): string[] {
@@ -85,5 +127,51 @@ export class FileDiscoveryService {
         }
         
         return score;
+    }
+
+    private static calculateContentScore(content: string, keywords: string[]): number {
+        const lowerContent = content.toLowerCase();
+        return keywords.reduce((score, keyword) => {
+            const matches = lowerContent.match(new RegExp(this.escapeRegExp(keyword), 'g'));
+            return score + (matches?.length ?? 0) * 3;
+        }, 0);
+    }
+
+    private static async readTextContent(uri: vscode.Uri): Promise<string> {
+        const binaryExtensions = new Set([
+            '.png', '.jpg', '.jpeg', '.gif', '.webp', '.ico', '.pdf', '.zip',
+            '.exe', '.dll', '.woff', '.woff2', '.ttf', '.eot', '.mp3', '.mp4'
+        ]);
+        const extension = uri.fsPath.toLowerCase().slice(uri.fsPath.lastIndexOf('.'));
+        if (binaryExtensions.has(extension)) {
+            return '';
+        }
+
+        try {
+            const bytes = await vscode.workspace.fs.readFile(uri);
+            const content = Buffer.from(bytes).toString('utf8');
+            return content.includes('\0') ? '' : content;
+        } catch {
+            return '';
+        }
+    }
+
+    private static escapeRegExp(value: string): string {
+        return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    }
+
+    private static symbolMatchScore(kind: string): number {
+        switch (kind.toLowerCase()) {
+            case 'class':
+                return 8;
+            case 'method':
+                return 10;
+            case 'interface':
+                return 6;
+            case 'function':
+                return 8;
+            default:
+                return 0;
+        }
     }
 }

@@ -52,7 +52,11 @@ export class CopilotService {
     public static buildChatPrompt(contextPackage: any): string {
         const t = contextPackage.ticket;
         const files = contextPackage.relevantFiles || [];
+        const symbols = contextPackage.symbols || [];
+        const methods = contextPackage.methods || [];
         const fileListStr = files.map((f: any) => `- ${f.relativePath}`).join('\n');
+        const symbolListStr = symbols.map((s: any) => `- ${s.name} (${s.kind})`).join('\n');
+        const methodListStr = methods.map((m: any) => `- ${m.name} (${m.kind}) in ${m.file}`).join('\n');
 
         return `Implement Azure DevOps ticket #${t.id}.
 
@@ -63,6 +67,12 @@ ${this.stripHtml(t.description)}
 
 Likely relevant files:
 ${fileListStr}
+
+Likely relevant classes and symbols:
+${symbolListStr || '- None found'}
+
+Likely relevant methods:
+${methodListStr || '- None found'}
 
 Read those files, then make the code changes directly in the workspace. Keep changes minimal, production-ready, and do not modify unrelated functionality.`;
     }
@@ -75,9 +85,13 @@ Read those files, then make the code changes directly in the workspace. Keep cha
     private static buildPrompt(contextPackage: any): vscode.LanguageModelChatMessage[] {
         const t = contextPackage.ticket;
         const files = contextPackage.relevantFiles || [];
+        const symbols = contextPackage.symbols || [];
+        const methods = contextPackage.methods || [];
 
         const fileListStr = files.map((f: any) => `- ${f.relativePath}`).join('\n');
         const contentsStr = files.map((f: any) => `### ${f.relativePath}\n\`\`\`\n${f.content}\n\`\`\``).join('\n\n');
+        const symbolsStr = symbols.map((s: any) => `- ${s.name} (${s.kind}), line ${s.line}`).join('\n');
+        const methodsStr = methods.map((m: any) => `- ${m.name} (${m.kind}), line ${m.line}, score ${m.score}`).join('\n');
 
         const userPrompt = `Ticket:
 ${t.title}
@@ -87,6 +101,12 @@ ${t.description}
 
 Relevant Files:
 ${fileListStr}
+
+Relevant Symbols and Classes:
+${symbolsStr || '- None found'}
+
+Relevant Methods:
+${methodsStr || '- None found'}
 
 Contents:
 ${contentsStr}

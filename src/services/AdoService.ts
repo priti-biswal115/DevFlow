@@ -18,6 +18,43 @@ export class AdoService {
         await context.secrets.store(this.PROJECT_KEY, project);
     }
 
+    static async getProjects(
+        context: vscode.ExtensionContext
+    ): Promise<string[]> {
+
+        const pat = await this.getPat(context);
+        const orgUrl = await this.getOrgUrl(context);
+
+        if (!pat || !orgUrl) {
+            throw new Error("Not connected.");
+        }
+
+        const auth = this.makeAuth(pat);
+
+        const response = await axios.get(
+            `${orgUrl}/_apis/projects?api-version=7.1`,
+            {
+                headers: {
+                    Authorization: `Basic ${auth}`
+                }
+            }
+        );
+
+        return response.data.value.map(
+            (project: any) => project.name
+        );
+    }
+
+    static async setProject(
+        context: vscode.ExtensionContext,
+        project: string
+    ) {
+        await context.secrets.store(
+            this.PROJECT_KEY,
+            project
+        );
+    }
+
     static async clearCredentials(context: vscode.ExtensionContext) {
         await context.secrets.delete(this.PAT_KEY);
         await context.secrets.delete(this.ORG_KEY);
@@ -92,12 +129,17 @@ export class AdoService {
             ? `${orgUrl}/${encodeURIComponent(project)}/_apis/wit/wiql?api-version=7.1`
             : `${orgUrl}/_apis/wit/wiql?api-version=7.1`;
 
+        // Explicit TeamProject filter, since URL scoping alone isn't always honored by the WIQL endpoint
+        const projectFilter = project
+            ? ` AND [System.TeamProject] = '${project.replace(/'/g, "''")}'`
+            : '';
+
         let wiqlResponse: any;
         try {
             wiqlResponse = await axios.post(
                 wiqlUrl,
                 {
-                    query: `SELECT [System.Id] FROM WorkItems WHERE [System.AssignedTo] = @Me AND [System.State] <> 'Closed' ORDER BY [System.ChangedDate] DESC`
+                    query: `SELECT [System.Id] FROM WorkItems WHERE [System.AssignedTo] = @Me AND [System.State] <> 'Closed'${projectFilter} ORDER BY [System.ChangedDate] DESC`
                 },
                 {
                     headers: {
