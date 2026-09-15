@@ -150,8 +150,10 @@ export class AdoService {
         headers: { Authorization: string; 'Content-Type': string },
         role: 'source' | 'target'
     ): Promise<void> {
+        // The Azure DevOps "Get Refs" filter expects the ref without the leading "refs/" segment.
+        const filter = refName.replace(/^refs\//, '');
         const response = await axios.get(
-            `${orgUrl}/${encodeURIComponent(project)}/_apis/git/repositories/${repositoryId}/refs?filter=${encodeURIComponent(refName)}&api-version=7.1`,
+            `${orgUrl}/${encodeURIComponent(project)}/_apis/git/repositories/${repositoryId}/refs?filter=${encodeURIComponent(filter)}&api-version=7.1`,
             { headers }
         );
 
