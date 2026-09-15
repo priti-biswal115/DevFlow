@@ -12,37 +12,58 @@ export class ContentSearchService {
     private static readonly excludePattern = '**/{node_modules,.git,dist,build,coverage,out}/**';
 
     public static async searchContent(searchTerms: string[]): Promise<ContentMatch[]> {
+        return this.searchContentByReadingFiles(searchTerms);
+    }
+
+    private static async searchContentByReadingFiles(searchTerms: string[]): Promise<ContentMatch[]> {
         const matches: ContentMatch[] = [];
-        const workspace = vscode.workspace as typeof vscode.workspace & {
-            findTextInFiles?: (
-                query: { pattern: string; isRegExp?: boolean; isCaseSensitive?: boolean; isWordMatch?: boolean },
-                options: { exclude?: string; maxResults?: number },
-                callback: (result: any) => void
-            ) => Thenable<unknown>;
-        };
+        const files = await vscode.workspace.findFiles('**/*', this.excludePattern, 1500);
 
-        if (!workspace.findTextInFiles) {
-            return [];
-        }
+        for (const uri of files) {
+            const content = await this.readTextContent(uri);
+            if (!content) {
+                continue;
+            }
 
-        for (const term of searchTerms.filter(Boolean)) {
-            await workspace.findTextInFiles(
-                { pattern: term, isRegExp: false, isCaseSensitive: false, isWordMatch: false },
-                { exclude: this.excludePattern, maxResults: 200 },
-                (result: any) => {
-                    const line = result.ranges[0]?.start.line ?? 0;
-                    matches.push({
-                        filePath: result.uri.fsPath,
-                        line: line + 1,
-                        term,
-                        score: this.scoreTerm(term, result.preview.text),
-                        reason: this.reasonFor(term, result.uri)
-                    });
+            const lowerContent = content.toLowerCase();
+            const lines = content.split(/\r?\n/);
+            for (const term of searchTerms.filter(Boolean)) {
+                const lowerTerm = term.toLowerCase();
+                if (!lowerContent.includes(lowerTerm)) {
+                    continue;
                 }
-            );
+
+                const lineIndex = lines.findIndex((line) => line.toLowerCase().includes(lowerTerm));
+                matches.push({
+                    filePath: uri.fsPath,
+                    line: lineIndex >= 0 ? lineIndex + 1 : 1,
+                    term,
+                    score: this.scoreTerm(term, lines[lineIndex] ?? content.slice(0, 200)),
+                    reason: this.reasonFor(term, uri)
+                });
+            }
         }
 
         return matches;
+    }
+
+    private static async readTextContent(uri: vscode.Uri): Promise<string> {
+        const binaryExtensions = new Set([
+            '.png', '.jpg', '.jpeg', '.gif', '.webp', '.ico', '.pdf', '.zip',
+            '.exe', '.dll', '.woff', '.woff2', '.ttf', '.eot', '.mp3', '.mp4'
+        ]);
+        const extension = uri.fsPath.toLowerCase().slice(uri.fsPath.lastIndexOf('.'));
+        if (binaryExtensions.has(extension)) {
+            return '';
+        }
+
+        try {
+            const bytes = await vscode.workspace.fs.readFile(uri);
+            const content = Buffer.from(bytes).toString('utf8');
+            return content.includes('\0') ? '' : content;
+        } catch {
+            return '';
+        }
     }
 
     private static scoreTerm(term: string, preview: string): number {

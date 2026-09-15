@@ -19,14 +19,15 @@ export class SymbolSearchService {
             );
 
             for (const symbol of symbols ?? []) {
-                if (!this.isNamedSymbol(symbol.name)) {
+                const kind = this.symbolKindToString(symbol.kind);
+                if (!this.isNamedSymbol(symbol.name) || !this.isSupportedKind(kind)) {
                     continue;
                 }
 
                 matches.push({
                     file: symbol.location.uri.fsPath,
                     symbol: symbol.name,
-                    kind: this.symbolKindToString(symbol.kind),
+                    kind,
                     line: symbol.location.range.start.line + 1,
                     score: this.scoreSymbol(symbol.kind)
                 });
@@ -48,6 +49,10 @@ export class SymbolSearchService {
 
     private static isNamedSymbol(name: string): boolean {
         return Boolean(name.trim()) && !/^<.*>$/.test(name.trim());
+    }
+
+    private static isSupportedKind(kind: string): boolean {
+        return ['Class', 'Function', 'Method', 'Interface'].includes(kind);
     }
 
     private static scoreSymbol(kind: vscode.SymbolKind): number {

@@ -431,6 +431,7 @@ export class TicketDetailsPanel {
         .file-match { font-size: 12px; font-weight: bold; color: var(--vscode-charts-green); }
         .method-list { margin: 4px 0 0 16px; font-size: 12px; }
         .method-link { color: var(--vscode-textLink-foreground); cursor: pointer; }
+        .reason-list { margin: 4px 0 0 16px; font-size: 12px; color: var(--vscode-descriptionForeground); }
 
         .pr-form {
             display: flex;
@@ -743,6 +744,9 @@ export class TicketDetailsPanel {
                                     <div class="file-path">\${f.relativePath}</div>
                                     <div class="method-list">\${(f.relevantMethods || []).map(m =>
                                         \`<div class="method-link" data-file="\${escapeHtml(m.file)}" data-line="\${m.line}">• \${escapeHtml(m.name)}()</div>\`
+                                    ).join('')}</div>
+                                    <div class="reason-list">\${(f.reasoning || []).map(reason =>
+                                        \`<div>• \${escapeHtml(reason)}</div>\`
                                     ).join('')}</div>
                                 </div>
                                 <span class="file-match">\${Math.round(f.score * 100)}% Match</span>

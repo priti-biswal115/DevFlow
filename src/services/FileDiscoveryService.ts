@@ -11,6 +11,7 @@ export interface DiscoveredFile {
     score: number;
     matchedSymbols: Array<Pick<SymbolMatch, 'symbol' | 'kind' | 'line'>>;
     relevantMethods: RelevantMethod[];
+    reasoning: string[];
 }
 
 export interface DiscoveryResult {
@@ -43,7 +44,14 @@ export class FileDiscoveryService {
             const relativePath = vscode.workspace.asRelativePath(uri);
             const pathScore = this.calculatePathScore(relativePath, searchTerms, understanding);
             if (pathScore > 0 || this.isLikelyFile(relativePath, understanding)) {
-                this.ensureCandidate(candidates, uri.fsPath, relativePath).pathScore += pathScore;
+                const file = this.ensureCandidate(candidates, uri.fsPath, relativePath);
+                file.pathScore += pathScore;
+                if (pathScore > 0) {
+                    file.reasoning.push('Filename or path matched ticket search terms.');
+                }
+                if (this.isLikelyFile(relativePath, understanding)) {
+                    file.reasoning.push(`Matched ${understanding.intent} likely-file pattern.`);
+                }
             }
         }
 
@@ -56,6 +64,7 @@ export class FileDiscoveryService {
             const relativePath = vscode.workspace.asRelativePath(match.filePath);
             const file = this.ensureCandidate(candidates, match.filePath, relativePath);
             file.contentScore += match.score;
+            file.reasoning.push(match.reason);
         }
 
         for (const symbol of symbols) {
@@ -67,6 +76,7 @@ export class FileDiscoveryService {
                 kind: symbol.kind,
                 line: symbol.line
             });
+            file.reasoning.push(`Matched ${symbol.kind.toLowerCase()} ${symbol.symbol}.`);
         }
 
         const rankedFiles = [...candidates.values()]
@@ -120,7 +130,8 @@ export class FileDiscoveryService {
             symbolScore: 0,
             rawScore: 0,
             matchedSymbols: [],
-            relevantMethods: []
+            relevantMethods: [],
+            reasoning: []
         };
         candidates.set(path, file);
         return file;
@@ -151,7 +162,7 @@ export class FileDiscoveryService {
     }
 
     private static hybridScore(file: CandidateFile): number {
-        return 0.2 * file.pathScore + 0.5 * file.contentScore + 0.3 * file.symbolScore;
+        return 0.3 * file.pathScore + 0.4 * file.contentScore + 0.3 * file.symbolScore;
     }
 
     private static intentBoost(relativePath: string, understanding: TicketUnderstanding): number {
