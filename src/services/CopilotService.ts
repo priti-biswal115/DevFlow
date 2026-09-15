@@ -1,6 +1,30 @@
 import * as vscode from 'vscode';
 
 export class CopilotService {
+    public static async executeAnalysis(
+        prompt: string,
+        token?: vscode.CancellationToken
+    ): Promise<string> {
+        const model = await this.getModel();
+        if (!model) {
+            throw new Error('No Copilot language model found. Please ensure GitHub Copilot is installed and you are signed in.');
+        }
+
+        const response = await model.sendRequest(
+            [vscode.LanguageModelChatMessage.User(prompt)],
+            {},
+            token ?? new vscode.CancellationTokenSource().token
+        );
+        let content = '';
+        for await (const chunk of response.text) {
+            if (token?.isCancellationRequested) {
+                break;
+            }
+            content += chunk;
+        }
+        return content;
+    }
+
     public static async executeTicket(
         contextPackage: any,
         onChunk: (chunk: string) => void,

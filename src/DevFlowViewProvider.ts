@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { AdoService } from './services/AdoService';
 import { TicketService } from './services/TicketService';
+import { CodeReviewService } from './services/CodeReviewService';
 import { Ticket } from './types/ticket';
 
 export class DevFlowViewProvider implements vscode.WebviewViewProvider {
@@ -57,6 +58,9 @@ export class DevFlowViewProvider implements vscode.WebviewViewProvider {
                 case 'openTicket':
                     this._handleOpenTicket(msg.id);
                     break;
+                case 'runCodeReview':
+                  await this._handleRunCodeReview();
+                  break;
             }
         });
     }
@@ -149,6 +153,19 @@ export class DevFlowViewProvider implements vscode.WebviewViewProvider {
         }
     }
 
+    private async _handleRunCodeReview() {
+      this._post({ type: 'codeReviewLoading', stage: 'Starting Code Review...' });
+      try {
+        const report = await CodeReviewService.runWorkspaceReview((stage) => {
+          this._post({ type: 'codeReviewLoading', stage });
+        });
+        this._post({ type: 'codeReviewLoaded', report });
+      } catch (error: any) {
+        const message = error instanceof Error ? error.message : String(error);
+        this._post({ type: 'codeReviewError', message });
+      }
+    }
+
     private _post(msg: object) {
         this._view?.webview.postMessage(msg);
     }
@@ -225,8 +242,6 @@ export class DevFlowViewProvider implements vscode.WebviewViewProvider {
   .nav-item:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
 
   .nav-item.tickets  { border-left-color: var(--vscode-charts-blue); }
-  .nav-item.security { border-left-color: var(--vscode-charts-red); }
-  .nav-item.deps     { border-left-color: var(--vscode-charts-orange); }
   .nav-item.review   { border-left-color: var(--vscode-charts-purple); }
 
   .nav-label { flex: 1; }
@@ -274,6 +289,12 @@ export class DevFlowViewProvider implements vscode.WebviewViewProvider {
     font-size: 12px;
     color: var(--vscode-descriptionForeground);
   }
+
+  .review-report { display: none; padding: 12px; border-bottom: 1px solid var(--vscode-panel-border); }
+  .review-status { color: var(--vscode-descriptionForeground); font-size: 12px; margin-bottom: 10px; }
+  .review-section { margin-top: 10px; }
+  .review-section h3 { font-size: 12px; margin-bottom: 4px; }
+  .review-section pre { white-space: pre-wrap; word-break: break-word; font-family: var(--vscode-font-family); font-size: 11px; color: var(--vscode-descriptionForeground); }
 </style>
 </head>
 <body>
@@ -302,22 +323,15 @@ export class DevFlowViewProvider implements vscode.WebviewViewProvider {
 
 <div id="ticketList"></div>
 
-<div class="nav-item security" role="button" tabindex="0">
-  <svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"><path d="M10 3 4 5.2v4.3c0 4 2.6 6.9 6 7.5 3.4-.6 6-3.5 6-7.5V5.2L10 3Z"/></svg>
-  <div class="nav-label"><div class="nav-title">Security scan</div></div>
-  <span class="chev">›</span>
-</div>
-
-<div class="nav-item deps" role="button" tabindex="0">
-  <svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"><path d="M10 3 3 6.5 10 10l7-3.5L10 3Z"/><path d="M3 6.5V14l7 3.5V10"/><path d="M17 6.5V14l-7 3.5"/></svg>
-  <div class="nav-label"><div class="nav-title">Dependencies</div></div>
-  <span class="chev">›</span>
-</div>
-
-<div class="nav-item review" role="button" tabindex="0">
+<div class="nav-item review" id="navCodeReview" role="button" tabindex="0">
   <svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M7 5 3 10l4 5"/><path d="M13 5l4 5-4 5"/></svg>
-  <div class="nav-label"><div class="nav-title">Code review</div></div>
+  <div class="nav-label"><div class="nav-title">Code Review</div><div class="nav-sub">Security, dependencies, and quality</div></div>
   <span class="chev">›</span>
+</div>
+
+<div class="review-report" id="reviewReport">
+  <div class="review-status" id="reviewStatus"></div>
+  <div id="reviewSections"></div>
 </div>
 
 <script>
@@ -330,6 +344,10 @@ export class DevFlowViewProvider implements vscode.WebviewViewProvider {
   const ticketList = document.getElementById('ticketList');
   const ticketBadge = document.getElementById('ticketBadge');
   const projectSelect = document.getElementById('projectSelect');
+  const navCodeReview = document.getElementById('navCodeReview');
+  const reviewReport = document.getElementById('reviewReport');
+  const reviewStatus = document.getElementById('reviewStatus');
+  const reviewSections = document.getElementById('reviewSections');
 
   // ── UI helpers ──────────────────────────────────────────────────────────────
 
@@ -405,6 +423,18 @@ export class DevFlowViewProvider implements vscode.WebviewViewProvider {
     if (e.key === 'Enter' || e.key === ' ') navTickets.click();
   });
 
+  navCodeReview.addEventListener('click', () => {
+    reviewReport.style.display = 'block';
+    reviewSections.innerHTML = '';
+    reviewStatus.textContent = 'Starting Code Review...';
+    navCodeReview.setAttribute('aria-busy', 'true');
+    vscode.postMessage({ type: 'runCodeReview' });
+  });
+
+  navCodeReview.addEventListener('keydown', e => {
+    if (e.key === 'Enter' || e.key === ' ') navCodeReview.click();
+  });
+
   // ── Messages from extension ─────────────────────────────────────────────────
 
   window.addEventListener('message', ({ data: msg }) => {
@@ -426,6 +456,27 @@ export class DevFlowViewProvider implements vscode.WebviewViewProvider {
       case 'ticketsError':
         ticketList.innerHTML = \`<div class="info-msg" style="color:var(--vscode-errorForeground)">\${escHtml(msg.message)}</div>\`;
         ticketList.style.display = 'block';
+        break;
+      case 'codeReviewLoading':
+        reviewReport.style.display = 'block';
+        reviewStatus.textContent = msg.stage;
+        break;
+      case 'codeReviewLoaded':
+        navCodeReview.setAttribute('aria-busy', 'false');
+        reviewStatus.textContent = msg.report.errors.length
+          ? 'Completed with some analysis errors.'
+          : 'Completed';
+        reviewSections.innerHTML = Object.entries(msg.report.sections).map(([title, content]) =>
+          \`<section class="review-section"><h3>\${escHtml(title)}</h3><pre>\${escHtml(content)}</pre></section>\`
+        ).join('') + (msg.report.errors.length
+          ? \`<section class="review-section"><h3>Analysis Errors</h3><pre>\${escHtml(msg.report.errors.join('\\n'))}</pre></section>\`
+          : '');
+        break;
+      case 'codeReviewError':
+        navCodeReview.setAttribute('aria-busy', 'false');
+        reviewStatus.textContent = 'Code Review failed';
+        reviewStatus.style.color = 'var(--vscode-errorForeground)';
+        reviewSections.innerHTML = \`<div class="info-msg">\${escHtml(msg.message)}</div>\`;
         break;
     }
   });
