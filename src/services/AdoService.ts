@@ -11,11 +11,13 @@ export class AdoService {
         context: vscode.ExtensionContext,
         pat: string,
         orgUrl: string,
-        project: string
+        project?: string
     ) {
         await context.secrets.store(this.PAT_KEY, pat);
         await context.secrets.store(this.ORG_KEY, orgUrl);
-        await context.secrets.store(this.PROJECT_KEY, project);
+        if (project !== undefined) {
+            await context.secrets.store(this.PROJECT_KEY, project);
+        }
     }
 
     static async getProjects(
