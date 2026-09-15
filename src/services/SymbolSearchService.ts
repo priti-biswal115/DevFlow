@@ -1,10 +1,11 @@
 import * as vscode from 'vscode';
 
 export interface SymbolMatch {
-    name: string;
+    file: string;
+    symbol: string;
     kind: string;
-    filePath: string;
     line: number;
+    score: number;
 }
 
 export class SymbolSearchService {
@@ -18,18 +19,23 @@ export class SymbolSearchService {
             );
 
             for (const symbol of symbols ?? []) {
+                if (!this.isNamedSymbol(symbol.name)) {
+                    continue;
+                }
+
                 matches.push({
-                    name: symbol.name,
+                    file: symbol.location.uri.fsPath,
+                    symbol: symbol.name,
                     kind: this.symbolKindToString(symbol.kind),
-                    filePath: symbol.location.uri.fsPath,
-                    line: symbol.location.range.start.line + 1
+                    line: symbol.location.range.start.line + 1,
+                    score: this.scoreSymbol(symbol.kind)
                 });
             }
         }
 
         const uniqueMatches = new Map<string, SymbolMatch>();
         for (const match of matches) {
-            const key = `${match.filePath}:${match.line}:${match.name}:${match.kind}`;
+            const key = `${match.file}:${match.line}:${match.symbol}:${match.kind}`;
             uniqueMatches.set(key, match);
         }
 
@@ -38,5 +44,23 @@ export class SymbolSearchService {
 
     private static symbolKindToString(kind: vscode.SymbolKind): string {
         return vscode.SymbolKind[kind] ?? String(kind);
+    }
+
+    private static isNamedSymbol(name: string): boolean {
+        return Boolean(name.trim()) && !/^<.*>$/.test(name.trim());
+    }
+
+    private static scoreSymbol(kind: vscode.SymbolKind): number {
+        switch (kind) {
+            case vscode.SymbolKind.Method:
+                return 10;
+            case vscode.SymbolKind.Class:
+            case vscode.SymbolKind.Function:
+                return 8;
+            case vscode.SymbolKind.Interface:
+                return 6;
+            default:
+                return 2;
+        }
     }
 }

@@ -8,6 +8,7 @@ type GitRepository = {
     rootUri: vscode.Uri;
     state: {
         refs: Array<{ name?: string; type?: number | string }>;
+        HEAD?: { name?: string };
         workingTreeChanges?: unknown[];
     };
     checkout(ref: string): Promise<void>;
@@ -93,6 +94,54 @@ export class GitService {
             .map((branch) => branch.trim())
             .filter(Boolean)
             .sort((a, b) => a.localeCompare(b));
+    }
+
+    public static async getCurrentBranch(): Promise<string> {
+        const repository = await this.getRepository();
+
+        const headName = repository.state.HEAD?.name;
+        if (headName) {
+            return headName.startsWith('refs/heads/') ? headName.slice('refs/heads/'.length) : headName;
+        }
+
+        const result = await execFileAsync(
+            'git',
+            ['branch', '--show-current'],
+            { cwd: repository.rootUri.fsPath }
+        );
+
+        return result.stdout.trim();
+    }
+
+    public static async getRepositoryName(): Promise<string> {
+        const remoteUrl = await this.getRemoteUrl();
+        const repoName = remoteUrl
+            .replace(/\.git$/i, '')
+            .split(/[/:\\]/)
+            .filter(Boolean)
+            .pop();
+
+        if (!repoName) {
+            throw new Error('Could not determine repository name from remote.origin.url.');
+        }
+
+        return repoName;
+    }
+
+    public static async getRemoteUrl(): Promise<string> {
+        const repository = await this.getRepository();
+        const result = await execFileAsync(
+            'git',
+            ['config', '--get', 'remote.origin.url'],
+            { cwd: repository.rootUri.fsPath }
+        );
+
+        const remoteUrl = result.stdout.trim();
+        if (!remoteUrl) {
+            throw new Error('No remote.origin.url is configured for this repository.');
+        }
+
+        return remoteUrl;
     }
 
     public static async startWork(

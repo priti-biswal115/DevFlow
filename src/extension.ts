@@ -5,6 +5,7 @@ import { DevFlowViewProvider } from './DevFlowViewProvider';
 import { TicketDetailsPanel } from './panels/TicketDetailsPanel';
 import { ChangeApplyService } from './services/ChangeApplyService';
 import { Ticket } from './types/ticket';
+import { PullRequestService } from './services/PullRequestService';
 
 
 // This method is called when your extension is activated
@@ -30,7 +31,13 @@ export function activate(context: vscode.ExtensionContext) {
 
 	context.subscriptions.push(
 		vscode.commands.registerCommand('devflow.openTicketDetails', (ticket: Ticket) => {
-			TicketDetailsPanel.render(ticket);
+			TicketDetailsPanel.render(ticket, context);
+		})
+	);
+
+	context.subscriptions.push(
+		vscode.commands.registerCommand('devflow.createPullRequest', async (payload: any) => {
+			return PullRequestService.createPullRequest(context, payload.ticket, payload.input);
 		})
 	);
 

@@ -11,7 +11,8 @@
   ],
   "activationEvents": [
     "onView:devflow.mainView",
-    "onCommand:devflow.helloWorld"
+    "onCommand:devflow.helloWorld",
+    "onCommand:devflow.createPullRequest"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -23,6 +24,10 @@
       {
         "command": "devflow.clearChangeHighlights",
         "title": "DevFlow: Clear Change Highlights"
+      },
+      {
+        "command": "devflow.createPullRequest",
+        "title": "DevFlow: Create Pull Request"
       }
     ],
     "viewsContainers": {

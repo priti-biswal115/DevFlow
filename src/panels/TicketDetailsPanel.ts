@@ -1,10 +1,11 @@
 import * as vscode from 'vscode';
 import { Ticket } from '../types/ticket';
-import { FileDiscoveryService, DiscoveredFile } from '../services/FileDiscoveryService';
+import { DiscoveryResult, FileDiscoveryService, DiscoveredFile } from '../services/FileDiscoveryService';
 import { CopilotService } from '../services/CopilotService';
 import { ChangeApplyService } from '../services/ChangeApplyService';
 import { GitService } from '../services/GitService';
 import { BranchSessionService } from '../services/BranchSessionService';
+import { PullRequestResult, PullRequestService } from '../services/PullRequestService';
 
 export class TicketDetailsPanel {
     public static currentPanel: TicketDetailsPanel | undefined;
@@ -13,10 +14,13 @@ export class TicketDetailsPanel {
     private _ticket: Ticket;
     private _cancellationTokenSource?: vscode.CancellationTokenSource;
     private _lastContextPackage: any;
+    private _lastDiscoveryResult?: DiscoveryResult;
+    private readonly _context: vscode.ExtensionContext;
 
-    private constructor(panel: vscode.WebviewPanel, ticket: Ticket) {
+    private constructor(panel: vscode.WebviewPanel, ticket: Ticket, context: vscode.ExtensionContext) {
         this._panel = panel;
         this._ticket = ticket;
+        this._context = context;
         this._update();
         this._panel.onDidDispose(() => this.dispose(), null, this._disposables);
 
@@ -59,6 +63,12 @@ export class TicketDetailsPanel {
                     case 'openInCopilotChat':
                         await this._handleOpenInCopilotChat();
                         break;
+                    case 'loadPullRequestBranches':
+                        await this._handleLoadPullRequestBranches();
+                        break;
+                    case 'createPullRequest':
+                        await this._handleCreatePullRequest(message);
+                        break;
                     case 'cancelAgent':
                         if (this._cancellationTokenSource) {
                             this._cancellationTokenSource.cancel();
@@ -71,7 +81,7 @@ export class TicketDetailsPanel {
         );
     }
 
-    public static render(ticket: Ticket) {
+    public static render(ticket: Ticket, context: vscode.ExtensionContext) {
         if (TicketDetailsPanel.currentPanel) {
             TicketDetailsPanel.currentPanel._panel.dispose();
         }
@@ -86,7 +96,7 @@ export class TicketDetailsPanel {
             }
         );
 
-        TicketDetailsPanel.currentPanel = new TicketDetailsPanel(panel, ticket);
+        TicketDetailsPanel.currentPanel = new TicketDetailsPanel(panel, ticket, context);
     }
 
     private async _handleLoadBranches() {
@@ -142,8 +152,13 @@ export class TicketDetailsPanel {
     private async _handleFindRelevantFiles() {
         try {
             this._panel.webview.postMessage({ type: 'discoveringFiles' });
-            const files = await FileDiscoveryService.findRelevantFiles(this._ticket);
-            this._panel.webview.postMessage({ type: 'filesDiscovered', files });
+            const discovery = await FileDiscoveryService.findRelevantFiles(this._ticket);
+            this._lastDiscoveryResult = discovery;
+            this._panel.webview.postMessage({
+                type: 'filesDiscovered',
+                files: discovery.files,
+                reasoning: discovery.reasoning
+            });
         } catch (error: any) {
             vscode.window.showErrorMessage(`Error finding relevant files: ${error.message}`);
             this._panel.webview.postMessage({ type: 'discoveryError', message: error.message });
@@ -159,6 +174,39 @@ export class TicketDetailsPanel {
             editor.selection = new vscode.Selection(position, position);
         } catch (error: any) {
             vscode.window.showErrorMessage(`DevFlow: could not open method location. ${error.message}`);
+        }
+    }
+
+    private async _handleLoadPullRequestBranches() {
+        try {
+            const [sourceBranch, branches] = await Promise.all([
+                PullRequestService.getCurrentBranch(),
+                PullRequestService.getAvailableTargetBranches()
+            ]);
+            this._panel.webview.postMessage({ type: 'pullRequestBranchesLoaded', sourceBranch, branches });
+        } catch (error: any) {
+            this._panel.webview.postMessage({ type: 'pullRequestError', message: error.message });
+        }
+    }
+
+    private async _handleCreatePullRequest(message: any) {
+        try {
+            const result = await vscode.commands.executeCommand<PullRequestResult>('devflow.createPullRequest', {
+                ticket: this._ticket,
+                input: {
+                    sourceBranch: message.sourceBranch,
+                    targetBranch: message.targetBranch,
+                    title: message.title,
+                    description: message.description
+                }
+            });
+            this._panel.webview.postMessage({ type: 'pullRequestCreated', result });
+            vscode.window.showInformationMessage(
+                result.url ? `Pull request created: ${result.url}` : 'Pull request created successfully.'
+            );
+        } catch (error: any) {
+            this._panel.webview.postMessage({ type: 'pullRequestError', message: error.message });
+            vscode.window.showErrorMessage(`DevFlow: ${error.message}`);
         }
     }
 
@@ -188,8 +236,9 @@ export class TicketDetailsPanel {
                     description: this._ticket.description,
                 },
                 relevantFiles: filesWithContents,
-                symbols: relevantFiles.flatMap((file) => file.matchedSymbols),
-                methods: relevantFiles.flatMap((file) => file.relevantMethods)
+                symbols: this._lastDiscoveryResult?.symbols ?? relevantFiles.flatMap((file) => file.matchedSymbols),
+                methods: this._lastDiscoveryResult?.methods ?? relevantFiles.flatMap((file) => file.relevantMethods),
+                reasoning: this._lastDiscoveryResult?.reasoning ?? []
             };
 
             this._panel.webview.postMessage({ type: 'contextPrepared', payload: this._lastContextPackage });
@@ -351,7 +400,7 @@ export class TicketDetailsPanel {
         button:hover { background: var(--vscode-button-hoverBackground); }
         button:disabled { opacity: 0.5; cursor: not-allowed; }
 
-        select, input {
+        select, input, textarea {
             color: var(--vscode-input-foreground);
             background: var(--vscode-input-background);
             border: 1px solid var(--vscode-input-border);
@@ -359,6 +408,7 @@ export class TicketDetailsPanel {
             border-radius: 3px;
             font-size: 13px;
         }
+        textarea { min-height: 130px; resize: vertical; font-family: var(--vscode-font-family); line-height: 1.45; }
         label { display: flex; flex-direction: column; gap: 6px; font-weight: 600; }
 
         #newBranchForm {
@@ -381,6 +431,20 @@ export class TicketDetailsPanel {
         .file-match { font-size: 12px; font-weight: bold; color: var(--vscode-charts-green); }
         .method-list { margin: 4px 0 0 16px; font-size: 12px; }
         .method-link { color: var(--vscode-textLink-foreground); cursor: pointer; }
+
+        .pr-form {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .pr-form select, .pr-form input, .pr-form textarea {
+            width: 100%;
+        }
+
+        .pr-actions {
+            margin-top: 8px;
+        }
         
         pre { background: var(--vscode-editor-background); padding: 10px; border-radius: 4px; overflow: auto; font-family: var(--vscode-editor-font-family); font-size: 12px; border: 1px solid var(--vscode-panel-border); }
         .hidden { display: none !important; }
@@ -442,7 +506,7 @@ export class TicketDetailsPanel {
     <div class="section">
         <h2>2. Agent Execution</h2>
         <p>Prepare the context package with the discovered files and ticket details for the AI Agent.</p>
-        <button id="btnSolve" disabled>Solve With Agent</button>
+        <button id="btnSolve" disabled>Start With Agent</button>
         <div id="agentStatus" class="hidden" style="color: var(--vscode-descriptionForeground); font-style: italic;">Preparing context...</div>
         
         <div id="agentPayloadContainer" class="hidden">
@@ -466,11 +530,29 @@ export class TicketDetailsPanel {
         </div>
     </div>
 
-    <!-- 3. PR Section -->
-    <div class="section" style="opacity: 0.7;">
-        <h2>3. PR Section</h2>
-        <p>Enabled only after solution generated.</p>
-        <button id="btnRaisePr" disabled>Raise PR</button>
+    <!-- 3. Pull Request -->
+    <div class="section">
+        <h2>3. Pull Request</h2>
+        <div class="pr-form">
+        <label>Source Branch
+            <input id="prSourceBranch" type="text" readonly placeholder="Loading current branch..." />
+        </label>
+        <label>Target Branch
+            <select id="prTargetBranch">
+                <option value="">Loading branches...</option>
+            </select>
+        </label>
+        <label>PR Title
+            <input id="prTitle" type="text" value="${this._escapeHtml(`Fix #${t.id}: ${t.title}`)}" />
+        </label>
+        <label>PR Description
+            <textarea id="prDescription" rows="5">${this._escapeHtml(this._prDescription())}</textarea>
+        </label>
+        <div class="pr-actions">
+            <button id="btnRaisePr" disabled>Create Pull Request</button>
+        </div>
+        </div>
+        <div id="prStatus" style="color: var(--vscode-descriptionForeground);">Start work, then create a pull request when your changes are ready.</div>
     </div>
 
     <script>
@@ -503,12 +585,24 @@ export class TicketDetailsPanel {
         const btnApplyChanges = document.getElementById('btnApplyChanges');
         const btnCopilotChat = document.getElementById('btnCopilotChat');
         const applyResult = document.getElementById('applyResult');
+        const prSourceBranch = document.getElementById('prSourceBranch');
+        const prTargetBranch = document.getElementById('prTargetBranch');
+        const prTitle = document.getElementById('prTitle');
+        const prDescription = document.getElementById('prDescription');
+        const btnRaisePr = document.getElementById('btnRaisePr');
+        const prStatus = document.getElementById('prStatus');
         
         let discoveredFiles = [];
         let fullAgentResponse = '';
+        let branchReady = false;
+
+        function refreshPrButton() {
+            btnRaisePr.disabled = !branchReady || !prSourceBranch.value || !prTargetBranch.value;
+        }
 
         vscode.postMessage({ type: 'loadBranches' });
         vscode.postMessage({ type: 'loadBranchSession' });
+        vscode.postMessage({ type: 'loadPullRequestBranches' });
 
         btnContinueWorking.addEventListener('click', () => {
             btnContinueWorking.disabled = true;
@@ -578,6 +672,18 @@ export class TicketDetailsPanel {
             vscode.postMessage({ type: 'openInCopilotChat' });
         });
 
+        btnRaisePr.addEventListener('click', () => {
+            btnRaisePr.disabled = true;
+            prStatus.textContent = 'Creating pull request...';
+            vscode.postMessage({
+                type: 'createPullRequest',
+                sourceBranch: prSourceBranch.value,
+                targetBranch: prTargetBranch.value,
+                title: prTitle.value,
+                description: prDescription.value
+            });
+        });
+
         window.addEventListener('message', event => {
             const message = event.data;
             switch (message.type) {
@@ -609,6 +715,10 @@ export class TicketDetailsPanel {
                         + ' | Working Branch: ' + message.workingBranch
                         + ' | Status: Ready';
                     branchStatus.style.color = 'var(--vscode-charts-green)';
+                    branchReady = true;
+                    prSourceBranch.value = message.workingBranch;
+                    refreshPrButton();
+                    prStatus.textContent = 'Create a pull request when your manual or agent changes are ready.';
                     btnFindFiles.disabled = false;
                     break;
                 case 'branchError':
@@ -675,6 +785,26 @@ export class TicketDetailsPanel {
                     streamingStatus.textContent = 'Status: Completed';
                     agentActions.classList.remove('hidden');
                     break;
+                case 'pullRequestBranchesLoaded':
+                    prSourceBranch.value = message.sourceBranch || '';
+                    prTargetBranch.innerHTML = message.branches
+                        .filter(branch => branch !== message.sourceBranch)
+                        .map(branch => '<option value="' + escapeHtml(branch) + '">' + escapeHtml(branch) + '</option>')
+                        .join('');
+                    refreshPrButton();
+                    break;
+                case 'pullRequestCreated':
+                    btnRaisePr.disabled = false;
+                    prStatus.textContent = message.result.url
+                        ? 'Pull request created: ' + message.result.url
+                        : 'Pull request created successfully.';
+                    prStatus.style.color = 'var(--vscode-charts-green)';
+                    break;
+                case 'pullRequestError':
+                    btnRaisePr.disabled = false;
+                    prStatus.textContent = 'Pull request failed: ' + message.message;
+                    prStatus.style.color = 'var(--vscode-errorForeground)';
+                    break;
                 case 'changesApplied':
                     applyResult.textContent = 'Applied to: ' + message.files.join(', ');
                     applyResult.classList.remove('hidden');
@@ -716,5 +846,13 @@ export class TicketDetailsPanel {
             .replace(/[^a-z0-9]+/g, '-')
             .replace(/^-+|-+$/g, '')
             .slice(0, 50);
+    }
+
+    private _prDescription(): string {
+        const summary = this._ticket.title.replace(/^#?\d+\s*/, '').trim();
+        return `Ticket: #${this._ticket.id}\n\nSummary:\n${summary}.\n\nFiles Changed:\n- Add files after reviewing changes\n\nTesting:\n- Application loads successfully\n- Relevant behavior verified\n\nImpact:\nUI/code update for the selected ticket\n\nDetails:\n${this._ticket.description
+            .replace(/<[^>]+>/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim()}`;
     }
 }

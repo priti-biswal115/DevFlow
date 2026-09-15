@@ -55,6 +55,117 @@ export class AdoService {
         );
     }
 
+    static async createPullRequest(
+        context: vscode.ExtensionContext,
+        input: {
+        repositoryName: string;
+        sourceBranch: string;
+        targetBranch: string;
+        title: string;
+        description: string;
+        }
+    ): Promise<{ url?: string; id?: number }> {
+        const pat = await this.getPat(context);
+        const orgUrl = await this.getOrgUrl(context);
+        const project = await this.getProject(context);
+        if (!pat || !orgUrl || !project) {
+            throw new Error('Connect to an Azure DevOps project before creating a pull request.');
+        }
+
+        const auth = this.makeAuth(pat);
+        const headers = { Authorization: `Basic ${auth}`, 'Content-Type': 'application/json' };
+
+        try {
+            const repository = await this.getGitRepository(orgUrl, project, input.repositoryName, headers);
+            const sourceRefName = this.toRefName(input.sourceBranch);
+            const targetRefName = this.toRefName(input.targetBranch);
+
+            await this.ensureBranchExists(orgUrl, project, repository.id, sourceRefName, headers, 'source');
+            await this.ensureBranchExists(orgUrl, project, repository.id, targetRefName, headers, 'target');
+
+            const response = await axios.post(
+                `${orgUrl}/${encodeURIComponent(project)}/_apis/git/repositories/${repository.id}/pullrequests?api-version=7.1`,
+                {
+                    sourceRefName,
+                    targetRefName,
+                    title: input.title,
+                    description: input.description
+                },
+                { headers }
+            );
+
+            return {
+                id: response.data?.pullRequestId,
+                url: response.data?._links?.web?.href ?? response.data?.url
+            };
+        } catch (error: any) {
+            if (axios.isAxiosError(error)) {
+                const detail = error.response?.data?.message
+                    || error.response?.data?.value?.message
+                    || error.response?.data?.error?.message
+                    || error.message;
+                throw new Error(`Pull request creation failed: ${detail}`);
+            }
+
+            throw error;
+        }
+    }
+
+    private static async getGitRepository(
+        orgUrl: string,
+        project: string,
+        repositoryName: string,
+        headers: { Authorization: string; 'Content-Type': string }
+    ): Promise<{ id: string; name: string }> {
+        const response = await axios.get(
+            `${orgUrl}/${encodeURIComponent(project)}/_apis/git/repositories?api-version=7.1`,
+            { headers }
+        );
+
+        const repositories: Array<{ id: string; name: string }> = response.data?.value ?? [];
+        const repository = repositories.find((repo) =>
+            repo.name.toLowerCase() === repositoryName.toLowerCase()
+        );
+
+        if (repository) {
+            return repository;
+        }
+
+        if (repositories.length === 1) {
+            return repositories[0];
+        }
+
+        throw new Error(
+            `Azure DevOps repository "${repositoryName}" was not found in project "${project}".`
+        );
+    }
+
+    private static async ensureBranchExists(
+        orgUrl: string,
+        project: string,
+        repositoryId: string,
+        refName: string,
+        headers: { Authorization: string; 'Content-Type': string },
+        role: 'source' | 'target'
+    ): Promise<void> {
+        const response = await axios.get(
+            `${orgUrl}/${encodeURIComponent(project)}/_apis/git/repositories/${repositoryId}/refs?filter=${encodeURIComponent(refName)}&api-version=7.1`,
+            { headers }
+        );
+
+        const refs: Array<{ name: string }> = response.data?.value ?? [];
+        const exists = refs.some((ref) => ref.name === refName);
+        if (!exists) {
+            throw new Error(
+                `The ${role} branch "${refName.replace('refs/heads/', '')}" does not exist in Azure Repos. Push it to Azure DevOps or select a branch that exists there.`
+            );
+        }
+    }
+
+    private static toRefName(branch: string): string {
+        return branch.startsWith('refs/heads/') ? branch : `refs/heads/${branch}`;
+    }
+
     static async clearCredentials(context: vscode.ExtensionContext) {
         await context.secrets.delete(this.PAT_KEY);
         await context.secrets.delete(this.ORG_KEY);
@@ -64,6 +175,7 @@ export class AdoService {
     static async getPat(context: vscode.ExtensionContext) {
         return context.secrets.get(this.PAT_KEY);
     }
+
 
     static async getOrgUrl(context: vscode.ExtensionContext) {
         return context.secrets.get(this.ORG_KEY);

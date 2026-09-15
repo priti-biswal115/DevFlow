@@ -1,177 +1,196 @@
 import * as vscode from 'vscode';
 import { Ticket } from '../types/ticket';
+import { ContentMatch, ContentSearchService } from './ContentSearchService';
 import { MethodDiscoveryService, RelevantMethod } from './MethodDiscoveryService';
 import { SymbolMatch, SymbolSearchService } from './SymbolSearchService';
+import { TicketUnderstanding, TicketUnderstandingService } from './TicketUnderstandingService';
 
 export interface DiscoveredFile {
     path: string;
     relativePath: string;
     score: number;
-    matchedSymbols: Array<Pick<SymbolMatch, 'name' | 'kind' | 'line'>>;
+    matchedSymbols: Array<Pick<SymbolMatch, 'symbol' | 'kind' | 'line'>>;
     relevantMethods: RelevantMethod[];
 }
 
+export interface DiscoveryResult {
+    files: DiscoveredFile[];
+    symbols: SymbolMatch[];
+    methods: RelevantMethod[];
+    reasoning: string[];
+}
+
+type CandidateFile = DiscoveredFile & {
+    pathScore: number;
+    contentScore: number;
+    symbolScore: number;
+    rawScore: number;
+};
+
 export class FileDiscoveryService {
-    public static async findRelevantFiles(ticket: Ticket): Promise<DiscoveredFile[]> {
-        // 1. Extract Keywords
-        const keywords = this.extractKeywords(ticket.title, ticket.description);
-        if (keywords.length === 0) {
-            return [];
+    public static async findRelevantFiles(ticket: Ticket): Promise<DiscoveryResult> {
+        const understanding = TicketUnderstandingService.understand(ticket.title, ticket.description);
+        const searchTerms = understanding.searchTerms;
+        if (searchTerms.length === 0) {
+            return { files: [], symbols: [], methods: [], reasoning: ['No useful search terms were extracted from the ticket.'] };
         }
 
-        // 2. Search Workspace
-        // Find all files excluding the standard ignores
         const excludePattern = '**/{node_modules,.git,dist,build,coverage,out}/**';
-        const files = await vscode.workspace.findFiles('**/*', excludePattern, 1000); // Limit to 1000 files to avoid performance issues
+        const workspaceFiles = await vscode.workspace.findFiles('**/*', excludePattern, 1500);
+        const candidates = new Map<string, CandidateFile>();
 
-        const symbols = await SymbolSearchService.searchSymbols(keywords);
-
-        // 3. Rank Matching Files
-        const rankedFiles = (await Promise.all(files.map(async uri => {
+        for (const uri of workspaceFiles) {
             const relativePath = vscode.workspace.asRelativePath(uri);
-            const score = this.calculateMatchScore(relativePath, keywords);
-            const content = await this.readTextContent(uri);
-            return {
-                path: uri.fsPath,
-                relativePath,
-                score: score + this.calculateContentScore(content, keywords),
-                matchedSymbols: [] as DiscoveredFile['matchedSymbols'],
-                relevantMethods: [] as RelevantMethod[]
-            };
-        }))).filter((file) => file.score > 0);
-
-        const filesByPath = new Map(rankedFiles.map(file => [file.path, file]));
-        for (const symbol of symbols) {
-            const file = filesByPath.get(symbol.filePath);
-            if (!file) {
-                continue;
+            const pathScore = this.calculatePathScore(relativePath, searchTerms, understanding);
+            if (pathScore > 0 || this.isLikelyFile(relativePath, understanding)) {
+                this.ensureCandidate(candidates, uri.fsPath, relativePath).pathScore += pathScore;
             }
+        }
 
-            file.score += this.symbolMatchScore(symbol.kind);
+        const [contentMatches, symbols] = await Promise.all([
+            ContentSearchService.searchContent(searchTerms),
+            SymbolSearchService.searchSymbols([...new Set([...searchTerms, ...understanding.likelySymbols])])
+        ]);
+
+        for (const match of contentMatches) {
+            const relativePath = vscode.workspace.asRelativePath(match.filePath);
+            const file = this.ensureCandidate(candidates, match.filePath, relativePath);
+            file.contentScore += match.score;
+        }
+
+        for (const symbol of symbols) {
+            const relativePath = vscode.workspace.asRelativePath(symbol.file);
+            const file = this.ensureCandidate(candidates, symbol.file, relativePath);
+            file.symbolScore += symbol.score;
             file.matchedSymbols.push({
-                name: symbol.name,
+                symbol: symbol.symbol,
                 kind: symbol.kind,
                 line: symbol.line
             });
         }
 
-        const relevantFiles = rankedFiles.filter(f => f.score > 0);
+        const rankedFiles = [...candidates.values()]
+            .map((file) => {
+                const boostedScore = this.hybridScore(file) + this.intentBoost(file.relativePath, understanding);
+                return { ...file, rawScore: boostedScore };
+            })
+            .filter((file) => file.rawScore > 0)
+            .sort((a, b) => b.rawScore - a.rawScore);
 
-        // Sort descending by score
-        relevantFiles.sort((a, b) => b.score - a.score);
-
-        // Normalize scores to be percentages of the max score if we want, or just max out at 1
-        // Here we'll just cap it at 1 for percentage display (e.g. 0.87 = 87%)
-        const maxScore = relevantFiles.length > 0 ? relevantFiles[0].score : 1;
-        const topFiles = relevantFiles.slice(0, 10);
+        const topFiles = rankedFiles.slice(0, 10);
         const methods = await MethodDiscoveryService.findRelevantMethods(
             topFiles.map((file) => file.path),
-            keywords
+            searchTerms
         );
-        const filesWithMethods = topFiles.map((file) => {
-            file.relevantMethods = methods.filter((method) => method.file === file.path);
-            return file;
-        });
 
-        const normalizedFiles = filesWithMethods.map(f => ({
-            ...f,
-            score: maxScore > 0 ? (f.score / maxScore) * 0.99 : 0 // max 99% for realism, adjust as needed
+        for (const file of topFiles) {
+            file.relevantMethods = methods.filter((method) => method.file === file.path).slice(0, 5);
+        }
+
+        const maxScore = topFiles[0]?.rawScore ?? 1;
+        const files = topFiles.map(({ pathScore, contentScore, symbolScore, rawScore, ...file }) => ({
+            ...file,
+            score: maxScore > 0 ? (rawScore / maxScore) * 0.99 : 0
         }));
 
-        // 4. Display Top 10
-        return normalizedFiles;
+        return {
+            files,
+            symbols,
+            methods,
+            reasoning: this.buildReasoning(understanding, files, contentMatches)
+        };
     }
 
-    private static extractKeywords(title: string, description: string): string[] {
-        // Simple extraction: combine text, lower case, remove html tags, remove non-alphanumeric, split
-        const htmlStrippedDesc = (description || '').replace(/<[^>]*>?/gm, ' ');
-        const combined = `${title || ''} ${htmlStrippedDesc}`.toLowerCase();
-        
-        const words = combined.match(/\b[a-z]{3,}\b/g) || [];
-        
-        // Basic stop words to ignore
-        const stopWords = new Set([
-            'the', 'and', 'for', 'with', 'this', 'that', 'you', 'not', 'are', 'from',
-            'have', 'but', 'all', 'what', 'can', 'will', 'any', 'which', 'there',
-            'has', 'was', 'were', 'they', 'their', 'when', 'how', 'about', 'out',
-            'like', 'one', 'then', 'so', 'some', 'them', 'would', 'could', 'should',
-            'our', 'these', 'those', 'also', 'just', 'only', 'very', 'even', 'into',
-            'because', 'than', 'upon', 'been', 'much', 'more', 'most', 'other', 'another',
-            'such', 'through', 'while', 'where', 'after', 'before', 'since', 'until',
-            'although', 'though', 'whether', 'both', 'each', 'every', 'either', 'neither',
-            'many', 'few', 'several', 'less', 'least', 'well', 'good', 'better', 'best',
-            'bad', 'worse', 'worst', 'right', 'wrong', 'true', 'false', 'yes', 'no',
-            'div', 'span', 'class', 'style', 'html', 'body', 'head', 'title', 'meta'
-        ]);
+    private static ensureCandidate(
+        candidates: Map<string, CandidateFile>,
+        path: string,
+        relativePath: string
+    ): CandidateFile {
+        const existing = candidates.get(path);
+        if (existing) {
+            return existing;
+        }
 
-        const keywords = words.filter(w => !stopWords.has(w));
-        
-        // Return unique keywords
-        return [...new Set(keywords)];
+        const file: CandidateFile = {
+            path,
+            relativePath,
+            score: 0,
+            pathScore: 0,
+            contentScore: 0,
+            symbolScore: 0,
+            rawScore: 0,
+            matchedSymbols: [],
+            relevantMethods: []
+        };
+        candidates.set(path, file);
+        return file;
     }
 
-    private static calculateMatchScore(filePath: string, keywords: string[]): number {
-        // Very basic ranking: check how many keywords appear in the file path
+    private static calculatePathScore(
+        relativePath: string,
+        searchTerms: string[],
+        understanding: TicketUnderstanding
+    ): number {
+        const lowerPath = relativePath.toLowerCase();
+        const fileName = lowerPath.split(/[\\/]/).pop() || '';
         let score = 0;
-        const lowerPath = filePath.toLowerCase();
-        
-        // Give higher weight to matches in the file name itself vs directory path
-        const fileName = lowerPath.split('/').pop() || '';
 
-        for (const kw of keywords) {
-            if (fileName.includes(kw)) {
-                score += 5; // Strong match in filename
-            } else if (lowerPath.includes(kw)) {
-                score += 1; // Weak match in path
+        for (const term of searchTerms.map((value) => value.toLowerCase())) {
+            if (fileName.includes(term)) {
+                score += 5;
+            } else if (lowerPath.includes(term)) {
+                score += 1;
             }
         }
-        
+
+        if (this.isLikelyFile(relativePath, understanding)) {
+            score += 8;
+        }
+
         return score;
     }
 
-    private static calculateContentScore(content: string, keywords: string[]): number {
-        const lowerContent = content.toLowerCase();
-        return keywords.reduce((score, keyword) => {
-            const matches = lowerContent.match(new RegExp(this.escapeRegExp(keyword), 'g'));
-            return score + (matches?.length ?? 0) * 3;
-        }, 0);
+    private static hybridScore(file: CandidateFile): number {
+        return 0.2 * file.pathScore + 0.5 * file.contentScore + 0.3 * file.symbolScore;
     }
 
-    private static async readTextContent(uri: vscode.Uri): Promise<string> {
-        const binaryExtensions = new Set([
-            '.png', '.jpg', '.jpeg', '.gif', '.webp', '.ico', '.pdf', '.zip',
-            '.exe', '.dll', '.woff', '.woff2', '.ttf', '.eot', '.mp3', '.mp4'
-        ]);
-        const extension = uri.fsPath.toLowerCase().slice(uri.fsPath.lastIndexOf('.'));
-        if (binaryExtensions.has(extension)) {
-            return '';
+    private static intentBoost(relativePath: string, understanding: TicketUnderstanding): number {
+        if (understanding.intent !== 'UI Metadata Change') {
+            return 0;
         }
 
-        try {
-            const bytes = await vscode.workspace.fs.readFile(uri);
-            const content = Buffer.from(bytes).toString('utf8');
-            return content.includes('\0') ? '' : content;
-        } catch {
-            return '';
+        const fileName = relativePath.toLowerCase().split(/[\\/]/).pop() || '';
+        if (['index.html', 'app.tsx', 'app.jsx', 'main.tsx', 'main.jsx'].includes(fileName)) {
+            return fileName === 'index.html' ? 30 : 12;
         }
+
+        return 0;
     }
 
-    private static escapeRegExp(value: string): string {
-        return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    private static isLikelyFile(relativePath: string, understanding: TicketUnderstanding): boolean {
+        const normalized = relativePath.replace(/\\/g, '/').toLowerCase();
+        return understanding.likelyFiles.some((likelyFile) => normalized.endsWith(likelyFile.toLowerCase()));
     }
 
-    private static symbolMatchScore(kind: string): number {
-        switch (kind.toLowerCase()) {
-            case 'class':
-                return 8;
-            case 'method':
-                return 10;
-            case 'interface':
-                return 6;
-            case 'function':
-                return 8;
-            default:
-                return 0;
+    private static buildReasoning(
+        understanding: TicketUnderstanding,
+        files: DiscoveredFile[],
+        contentMatches: ContentMatch[]
+    ): string[] {
+        const reasoning = [`Ticket intent: ${understanding.intent}.`];
+        if (understanding.intent === 'UI Metadata Change') {
+            reasoning.push('Ticket appears related to website title metadata.');
         }
+
+        for (const file of files.slice(0, 5)) {
+            const matches = contentMatches.filter((match) => match.filePath === file.path);
+            if (matches.length > 0) {
+                reasoning.push(matches[0].reason);
+            } else if (this.isLikelyFile(file.relativePath, understanding)) {
+                reasoning.push(`${file.relativePath} is a likely file for ${understanding.intent}.`);
+            }
+        }
+
+        return [...new Set(reasoning)];
     }
 }
