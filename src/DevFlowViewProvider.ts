@@ -10,13 +10,14 @@ export class DevFlowViewProvider implements vscode.WebviewViewProvider {
     private _connected = false;
 
     constructor(private readonly context: vscode.ExtensionContext) {
-        this.initializeConnection();
     }
 
     // ── Auto reconnect ─────────────────────────────────────────────────────────
 
     private async initializeConnection(): Promise<void> {
         try {
+        this._post({ type: 'status', state: 'connecting' });
+
             const isValid = await AdoService.validateConnection(this.context);
             this._connected = isValid;
 
@@ -36,6 +37,8 @@ export class DevFlowViewProvider implements vscode.WebviewViewProvider {
         this._view = webviewView;
         webviewView.webview.options = { enableScripts: true };
         webviewView.webview.html = this._buildHtml();
+
+        this.initializeConnection();
 
         webviewView.webview.onDidReceiveMessage(async (msg) => {
             switch (msg.type) {
@@ -58,27 +61,20 @@ export class DevFlowViewProvider implements vscode.WebviewViewProvider {
         });
     }
 
+
     // ── Connect ────────────────────────────────────────────────────────────────
 
     private async _handleConnect() {
         const orgUrl = await vscode.window.showInputBox({
-            title: 'Azure DevOps — Step 1/3',
+            title: 'Azure DevOps — Step 1/2',
             prompt: 'Organization URL',
             placeHolder: 'https://dev.azure.com/your-org',
             ignoreFocusOut: true
         });
         if (!orgUrl) { return; }
 
-        const project = await vscode.window.showInputBox({
-            title: 'Azure DevOps — Step 2/3',
-            prompt: 'Project name',
-            placeHolder: 'e.g. DevFlow',
-            ignoreFocusOut: true
-        });
-        if (project === undefined) { return; }
-
         const pat = await vscode.window.showInputBox({
-            title: 'Azure DevOps — Step 3/3',
+            title: 'Azure DevOps — Step 2/2',
             prompt: 'Personal Access Token (PAT)',
             password: true,
             ignoreFocusOut: true
@@ -88,13 +84,14 @@ export class DevFlowViewProvider implements vscode.WebviewViewProvider {
         // Show connecting state
         this._post({ type: 'status', state: 'connecting' });
 
-        await AdoService.saveCredentials(this.context, pat, orgUrl, project);
+        await AdoService.saveCredentials(this.context, pat, orgUrl);
         const ok = await AdoService.validateConnection(this.context);
 
         if (ok) {
             this._connected = true;
             this._post({ type: 'status', state: 'connected' });
             await this._handleFetchProjects();
+            await this._handleFetchTickets();
         } else {
             // Clear bad credentials
             await AdoService.clearCredentials(this.context);
@@ -108,7 +105,12 @@ export class DevFlowViewProvider implements vscode.WebviewViewProvider {
     private async _handleFetchProjects() {
         try {
             const projects = await AdoService.getProjects(this.context);
-            this._post({ type: 'projectsLoaded', projects });
+            let currentProject = await AdoService.getProject(this.context);
+            if ((!currentProject || !projects.includes(currentProject)) && projects.length > 0) {
+                currentProject = projects[0];
+                await AdoService.setProject(this.context, currentProject);
+            }
+            this._post({ type: 'projectsLoaded', projects, selected: currentProject });
         } catch (err: any) {
             this._post({ type: 'projectsError', message: err.message });
         }
@@ -418,8 +420,8 @@ export class DevFlowViewProvider implements vscode.WebviewViewProvider {
         renderTickets(msg.tickets);
         break;
       case 'projectsLoaded':
-        projectSelect.innerHTML = msg.projects.map(p => \`<option value="\${escHtml(p)}">\${escHtml(p)}</option>\`).join('');
-        projectSelect.style.display = '';
+        projectSelect.innerHTML = msg.projects.map(p => \`<option value="\${escHtml(p)}"\${msg.selected === p ? ' selected' : ''}>\${escHtml(p)}</option>\`).join('');
+        projectSelect.style.display = msg.projects.length > 0 ? '' : 'none';
         break;
       case 'ticketsError':
         ticketList.innerHTML = \`<div class="info-msg" style="color:var(--vscode-errorForeground)">\${escHtml(msg.message)}</div>\`;
